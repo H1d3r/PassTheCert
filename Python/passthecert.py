@@ -30,6 +30,7 @@ import string
 import random
 import logging
 import argparse
+import shlex
 
 import ssl
 import ldap3
@@ -59,6 +60,30 @@ class LdapShell(_LdapShell):
 
     def do_dump(self, line):
         logging.warning("Not implemented")
+
+    def do_remove_user_from_group(self, line):
+        user_name, group_name = shlex.split(line)
+
+        user_dn = self.get_dn(user_name)
+        if not user_dn:
+            raise Exception("User not found in LDAP: %s" % user_name)
+
+        group_dn = self.get_dn(group_name)
+        if not group_dn:
+            raise Exception("Group not found in LDAP: %s" % group_name)
+
+        user_name = user_dn.split(',')[0][3:]
+        group_name = group_dn.split(',')[0][3:]
+
+        res = self.client.modify(group_dn, {'member': [(ldap3.MODIFY_DELETE, [user_dn])]})
+        if res:
+            print('Removing user: %s from group %s result: OK' % (user_name, group_name))
+        else:
+            raise Exception('Failed to remove user from %s group: %s' % (group_name, str(self.client.result['description'])))
+
+    def do_help(self, line):
+        super().do_help(line)
+        print(" remove_user_from_group user group - Removes a user from a group.")
 
     def do_exit(self, line):
         print("Bye!")
@@ -102,19 +127,21 @@ def create_empty_sd():
 # Create an ALLOW ACE with the specified sid
 def create_allow_ace(sid, guid_str=False):
     nace = ldaptypes.ACE()
-    nace['AceType'] = ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE
     nace['AceFlags'] = 0x00
-    acedata = ldaptypes.ACCESS_ALLOWED_ACE()
+    if guid_str:
+        nace['AceType'] = ldaptypes.ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE
+        acedata = ldaptypes.ACCESS_ALLOWED_OBJECT_ACE()
+        acedata['Flags'] = ldaptypes.ACCESS_ALLOWED_OBJECT_ACE.ACE_OBJECT_TYPE_PRESENT
+        acedata['ObjectType'] = string_to_bin(guid_str)
+        acedata['InheritedObjectType'] = b''
+    else:
+        nace['AceType'] = ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE
+        acedata = ldaptypes.ACCESS_ALLOWED_ACE()
     acedata['Mask'] = ldaptypes.ACCESS_MASK()
-    acedata['Mask']['Mask'] = 983551  # Full control
+    acedata['Mask']['Mask'] = (ldaptypes.ACCESS_ALLOWED_OBJECT_ACE.ADS_RIGHT_DS_CONTROL_ACCESS
+                               if guid_str else 983551)  # Full control
     acedata['Sid'] = ldaptypes.LDAP_SID()
     acedata['Sid'].fromCanonical(sid)
-    if guid_str:
-        acedata['ObjectType'] = string_to_bin(guid_str)
-        acedata['ObjectTypeLen'] = len(string_to_bin(guid_str))
-        acedata['InheritedObjectTypeLen'] = 0
-        acedata['InheritedObjectType'] = b''
-    acedata['Flags'] = 1
     nace['Ace'] = acedata
     return nace
 
@@ -385,6 +412,96 @@ class ManageUser:
         else:
             logging.info("Granted user '%s' DCSYNC rights!" % (self.__accountName))
 
+    def revertElevate(self, forestDN=None):
+        if forestDN is None:
+            forestDN = self.__baseDN
+
+        replication_guids = {
+            string_to_bin(guid) for guid in (
+                '1131f6aa-9c07-11d1-f79f-00c04fc2dcd2',
+                '1131f6ad-9c07-11d1-f79f-00c04fc2dcd2',
+                '89e95b76-444d-4c62-991a-0facbeda640c',
+            )
+        }
+
+        res = self.ldapConn.search(search_base=self.__baseDN,
+                                   search_filter=f'(distinguishedName={forestDN})',
+                                   attributes=['nTSecurityDescriptor'])
+        if not res or not self.ldapConn.entries:
+            raise Exception("Failed to get forest's SD")
+
+        baseDN_sd = self.ldapConn.entries[0].entry_raw_attributes
+        if baseDN_sd['nTSecurityDescriptor'] == []:
+            raise Exception("User doesn't have right read nTSecurityDescriptor!")
+
+        sd = ldaptypes.SR_SECURITY_DESCRIPTOR(data=baseDN_sd['nTSecurityDescriptor'][0])
+        kept_aces = []
+        removed = 0
+        legacy_candidates = []
+
+        for ace in sd['Dacl'].aces:
+            ace_sid = ace['Ace']['Sid'].formatCanonical()
+            if ace_sid != self.__targetSID:
+                kept_aces.append(ace)
+                continue
+
+            if ace['AceType'] == ldaptypes.ACCESS_ALLOWED_OBJECT_ACE.ACE_TYPE:
+                object_type = ace['Ace']['ObjectType']
+                if object_type in replication_guids:
+                    removed += 1
+                    continue
+
+            # Older versions of this script accidentally serialized the three
+            # GUID-specific entries as identical, non-inherited full-control ACEs.
+            if (ace['AceType'] == ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE and
+                    ace['AceFlags'] == 0 and ace['Ace']['Mask']['Mask'] == 983551):
+                legacy_candidates.append(ace)
+                continue
+
+            kept_aces.append(ace)
+
+        if removed == 0 and len(legacy_candidates) > 0:
+            removed = len(legacy_candidates)
+            logging.warning('Removing %d legacy ACE(s) created by the former -elevate implementation', removed)
+        else:
+            kept_aces.extend(legacy_candidates)
+
+        if removed == 0:
+            logging.info("No DCSYNC rights installed by -elevate were found for '%s'." % self.__accountName)
+            return
+
+        sd['Dacl'].aces = kept_aces
+        res = self.ldapConn.modify(forestDN,
+                                   {'nTSecurityDescriptor': [ldap3.MODIFY_REPLACE, [sd.getData()]]})
+        if not res:
+            if self.ldapConn.result['result'] == ldap3.core.results.RESULT_INSUFFICIENT_ACCESS_RIGHTS:
+                raise Exception("User doesn't have right to modify %s!" % forestDN)
+            elif self.ldapConn.result['result'] == ldap3.core.results.RESULT_UNWILLING_TO_PERFORM:
+                raise Exception("Unwilling to Perform: %s" % self.ldapConn.result['message'])
+            else:
+                raise Exception(str(self.ldapConn.result))
+        logging.info("Revoked DCSYNC rights from user '%s'." % self.__accountName)
+
+    def delete(self):
+        try:
+            confirmation = input("Confirm deletion of user '%s' by typing the username: " % self.__accountName)
+        except EOFError:
+            logging.info("Deletion cancelled: no confirmation received.")
+            return
+        if confirmation != self.__accountName:
+            logging.info("Deletion cancelled.")
+            return
+
+        res = self.ldapConn.delete(self.__targetDN)
+        if not res:
+            if self.ldapConn.result['result'] == ldap3.core.results.RESULT_INSUFFICIENT_ACCESS_RIGHTS:
+                raise Exception("User doesn't have right to delete %s!" % self.__targetDN)
+            elif self.ldapConn.result['result'] == ldap3.core.results.RESULT_NO_SUCH_OBJECT:
+                raise Exception("Target DN '%s' does not exist!" % self.__targetDN)
+            else:
+                raise Exception(str(self.ldapConn.result))
+        logging.info("Successfully deleted user '%s'." % self.__accountName)
+
     def changePWD(self, newPWD):
         if newPWD is False:
             newPWD = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(32))
@@ -559,12 +676,13 @@ if __name__ == '__main__':
                        help='Destination port to connect to. LDAPS (via StartTLS) on 389 or LDAPS on 636.')
 
     group = parser.add_argument_group('Action')
-    group.add_argument('-action', choices=['add_computer', 'del_computer', 'modify_computer', 'read_rbcd', 'write_rbcd', 'remove_rbcd', 'flush_rbcd', 'modify_user', 'whoami', 'ldap-shell'], nargs='?', default='whoami')
+    group.add_argument('-action', choices=['add_computer', 'del_computer', 'modify_computer', 'read_rbcd', 'write_rbcd', 'remove_rbcd', 'flush_rbcd', 'modify_user', 'del_user', 'whoami', 'ldap-shell'], nargs='?', default='whoami')
 
     group = parser.add_argument_group('Manage User')
     group.add_argument('-target', action='store', metavar='sAMAccountName', help='sAMAccountName of user to target.')
     group.add_argument('-new-pass',  action='store', metavar='Password', help='New password of target.', const=False, nargs='?')
     group.add_argument('-elevate', action='store_true', help='Grant target account DCSYNC rights')
+    group.add_argument('-revert-elevate', action='store_true', help='Revoke target account DCSYNC rights previously granted by -elevate')
 
     group = parser.add_argument_group('Manage Computer')
     group.add_argument('-baseDN', action='store', metavar='DC=test,DC=local', help='Set baseDN for LDAP.'
@@ -652,17 +770,24 @@ if __name__ == '__main__':
             # Using bind() function will raise an error, we just have to open() the connection
             ldapConn.open()
 
-        if options.action in ('modify_user'):
+        if options.action in ('modify_user', 'del_user'):
             if options.target is None:
                 logging.critical('-target is required !')
                 sys.exit(1)
             manage = ManageUser(ldapConn, options)
-            if options.elevate:
+            if options.action == 'del_user':
+                manage.delete()
+            elif options.elevate and options.revert_elevate:
+                logging.critical('-elevate and -revert-elevate are mutually exclusive!')
+                sys.exit(1)
+            elif options.elevate:
                 manage.elevate()
+            elif options.revert_elevate:
+                manage.revertElevate()
             elif options.new_pass is not None:
                 manage.changePWD(options.new_pass)
             else:
-                logging.critical('User modification option (-elevate|-new-pass) needed!')
+                logging.critical('User modification option (-elevate|-revert-elevate|-new-pass) needed!')
 
         elif options.action in ('add_computer','del_computer','modify_computer', 'whoami', 'ldap-shell'):
             manage = ManageComputer(ldapConn, options)
