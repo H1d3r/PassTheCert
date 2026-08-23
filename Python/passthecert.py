@@ -482,15 +482,16 @@ class ManageUser:
                 raise Exception(str(self.ldapConn.result))
         logging.info("Revoked DCSYNC rights from user '%s'." % self.__accountName)
 
-    def delete(self):
-        try:
-            confirmation = input("Confirm deletion of user '%s' by typing the username: " % self.__accountName)
-        except EOFError:
-            logging.info("Deletion cancelled: no confirmation received.")
-            return
-        if confirmation != self.__accountName:
-            logging.info("Deletion cancelled.")
-            return
+    def delete(self, no_confirm=False):
+        if not no_confirm:
+            try:
+                confirmation = input("Confirm deletion of user '%s' by typing the username: " % self.__accountName)
+            except EOFError:
+                logging.info("Deletion cancelled: no confirmation received.")
+                return
+            if confirmation != self.__accountName:
+                logging.info("Deletion cancelled.")
+                return
 
         res = self.ldapConn.delete(self.__targetDN)
         if not res:
@@ -683,6 +684,7 @@ if __name__ == '__main__':
     group.add_argument('-new-pass',  action='store', metavar='Password', help='New password of target.', const=False, nargs='?')
     group.add_argument('-elevate', action='store_true', help='Grant target account DCSYNC rights')
     group.add_argument('-revert-elevate', action='store_true', help='Revoke target account DCSYNC rights previously granted by -elevate')
+    group.add_argument('-no-confirm', action='store_true', help='Do not ask for confirmation when deleting a user')
 
     group = parser.add_argument_group('Manage Computer')
     group.add_argument('-baseDN', action='store', metavar='DC=test,DC=local', help='Set baseDN for LDAP.'
@@ -719,6 +721,9 @@ if __name__ == '__main__':
         sys.exit(1)
 
     options = parser.parse_args()
+
+    if options.no_confirm and options.action != 'del_user':
+        parser.error('-no-confirm can only be used with -action del_user')
 
     if options.debug is True:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -776,7 +781,7 @@ if __name__ == '__main__':
                 sys.exit(1)
             manage = ManageUser(ldapConn, options)
             if options.action == 'del_user':
-                manage.delete()
+                manage.delete(options.no_confirm)
             elif options.elevate and options.revert_elevate:
                 logging.critical('-elevate and -revert-elevate are mutually exclusive!')
                 sys.exit(1)

